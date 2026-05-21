@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+
+# User-specific settings
+*.user
+*.suo
+.vs/
+
+# Runtime config (contains API key!)
+config.json
+
+# Proxy list (generated at runtime)
+proxies.txt
+
+# Temp captcha images
+/tmp/cap_*
+
+# OS
+.DS_Store
+Thumbs.db
