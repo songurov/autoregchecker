@@ -160,18 +160,51 @@ var results = new List<PlateResult>();
 Console.WriteLine($"\n{"Nr",-5} {"Proxy",-22} {"Număr",-12} {"Captcha",-8} {"Rezultat"}");
 Console.WriteLine(new string('-', 70));
 
+const int ProbeEvery = 5; // canary check every N plates
+
 for (int i = startNum; i <= endNum; i++)
 {
     string plate = prefix + (padWidth > 0 ? i.ToString().PadLeft(padWidth, '0') : i.ToString());
     PlateResult pr;
 
+    // Periodic canary: probe captcha URL before real request
+    int seq = i - startNum;
+    if (seq > 0 && seq % ProbeEvery == 0)
+    {
+        bool alive = await ProbeProxy(http);
+        if (!alive)
+        {
+            Console.WriteLine($"      [PROBE] Proxy inactiv → rotire preventivă: {ProxyLabel(currentProxy)}");
+            http.Dispose();
+            bool found = false;
+            while (!found)
+            {
+                string? candidate;
+                if (freshWorking.TryDequeue(out var bgProxy))
+                    candidate = bgProxy;
+                else
+                {
+                    proxyIdx++;
+                    if (proxyIdx >= proxies.Count) break;
+                    candidate = proxies[proxyIdx];
+                }
+                (http, jar) = CreateHttpClient(candidate);
+                if (await InitSession(http, jar)) { currentProxy = candidate; found = true; }
+                else http.Dispose();
+            }
+            if (!found) { Console.WriteLine("      ✗ Toate proxy-urile epuizate. Oprire."); goto Done; }
+            Console.WriteLine($"      [PROBE] Activ: {ProxyLabel(currentProxy)}");
+        }
+    }
+
     while (true)
     {
         pr = await CheckPlate(http, apiKey, plate, signDest, maxRetry);
 
-        if (pr.RawResponse is "network_timeout" or "network_fail")
+        if (pr.RawResponse is "network_timeout" or "network_fail" or "ip_blocked")
         {
-            Console.WriteLine($"      ↳ Block/timeout pe: {ProxyLabel(currentProxy)}");
+            string reason = pr.RawResponse == "ip_blocked" ? "IP BLOCAT" : "Timeout/rețea";
+            Console.WriteLine($"      ↳ {reason} pe: {ProxyLabel(currentProxy)}");
             http.Dispose();
 
             bool found = false;
@@ -359,6 +392,17 @@ static async Task<bool> InitSession(HttpClient http, CookieContainer jar)
     }
 }
 
+static async Task<bool> ProbeProxy(HttpClient http)
+{
+    try
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var resp = await http.GetAsync(CaptchaUrl, cts.Token);
+        return !IsBlockedStatus((int)resp.StatusCode) && resp.IsSuccessStatusCode;
+    }
+    catch { return false; }
+}
+
 static string ProxyLabel(string? proxy) =>
     proxy is null ? "direct" : Regex.Replace(proxy, @"//[^:@]+:[^@]+@", "//***:***@");
 
@@ -462,9 +506,17 @@ static async Task<PlateResult> CheckPlate(
         string raw;
         try
         {
-            raw = (await (await http.SendAsync(postReq)).Content.ReadAsStringAsync()).Trim();
+            using var postCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            var postResp = await http.SendAsync(postReq, postCts.Token);
+            if (IsBlockedStatus((int)postResp.StatusCode))
+                return new PlateResult(plate, captcha, "ip_blocked", PlateStatus.Error, $"IP blocat (HTTP {(int)postResp.StatusCode})");
+            raw = (await postResp.Content.ReadAsStringAsync(postCts.Token)).Trim();
         }
-        catch (Exception ex) when (ex is TaskCanceledException or HttpRequestException)
+        catch (Exception ex) when (ex is TaskCanceledException or OperationCanceledException)
+        {
+            return new PlateResult(plate, captcha, "network_timeout", PlateStatus.Error, "Timeout rețea");
+        }
+        catch (HttpRequestException)
         {
             return new PlateResult(plate, captcha, "network_fail", PlateStatus.Error, "Rețea căzută");
         }
@@ -479,15 +531,28 @@ static async Task<PlateResult> CheckPlate(
     return new PlateResult(plate, "?", "max_retry", PlateStatus.Error, "Max retry depășit");
 }
 
+static bool IsBlockedStatus(int code) =>
+    code is 403 or 429 or 503 or 520 or 521 or 522 or 523 or 524;
+
 static async Task<byte[]?> FetchWithRetry(HttpClient http, string url, int maxAttempts = 2)
 {
     for (int i = 1; i <= maxAttempts; i++)
     {
-        try { return await http.GetByteArrayAsync(url); }
-        catch (Exception ex) when (ex is TaskCanceledException or TimeoutException or HttpRequestException)
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var resp = await http.GetAsync(url, cts.Token);
+            if (IsBlockedStatus((int)resp.StatusCode))
+            {
+                Console.WriteLine($"      [!] HTTP {(int)resp.StatusCode} → IP blocat");
+                return null;
+            }
+            return await resp.Content.ReadAsByteArrayAsync(cts.Token);
+        }
+        catch (Exception ex) when (ex is TaskCanceledException or OperationCanceledException or HttpRequestException)
         {
             if (i == maxAttempts) return null;
-            await Task.Delay(i * 2000);
+            await Task.Delay(i * 1500);
         }
     }
     return null;
