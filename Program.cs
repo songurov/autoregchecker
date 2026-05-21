@@ -486,9 +486,6 @@ static async Task<PlateResult> CheckPlate(
                 CaptchaMs: captchaMs, OpenAiMs: openAiMs);
         }
 
-        // Simulate human reading time before submitting
-        await Task.Delay(Random.Shared.Next(1500, 3001));
-
         var fields = new Dictionary<string, string>
         {
             ["numbermask"]       = plate,
@@ -535,8 +532,17 @@ static async Task<PlateResult> CheckPlate(
                 CaptchaMs: captchaMs, OpenAiMs: openAiMs);
         }
 
-        if (raw.Equals("error0", StringComparison.OrdinalIgnoreCase) && attempt < maxRetry)
+        bool isCaptchaError =
+            raw.Equals("error0", StringComparison.OrdinalIgnoreCase) ||
+            raw.Contains("wrong_captcha",  StringComparison.OrdinalIgnoreCase) ||
+            raw.Contains("captcha_error",  StringComparison.OrdinalIgnoreCase) ||
+            raw.Contains("invalid_captcha", StringComparison.OrdinalIgnoreCase);
+
+        if (isCaptchaError && attempt < maxRetry)
+        {
+            Console.WriteLine($"      [captcha#{attempt}] greșit ({captcha}) → retry...");
             continue;
+        }
 
         var (status, text, cost) = ClassifyResult(raw);
         return new PlateResult(plate, captcha, raw, status, text, cost, payload,
@@ -584,10 +590,13 @@ static (PlateStatus, string, decimal) ClassifyResult(string raw)
             decimal cost = decimal.TryParse(doc.Root?.Element("number_cost")?.Value, out var c) ? c : 0;
             return res.ToLowerInvariant() switch
             {
-                "number_free" => (PlateStatus.Available, "Disponibil",   cost),
-                "number_busy" => (PlateStatus.Occupied,  "Ocupat",       cost),
-                "error"       => (PlateStatus.Occupied,  "Indisponibil", cost),
-                _             => (PlateStatus.Error,     $"XML necunoscut: {res}", cost)
+                "number_free"     => (PlateStatus.Available, "Disponibil",    cost),
+                "number_busy"     => (PlateStatus.Occupied,  "Ocupat",        cost),
+                "error"           => (PlateStatus.Occupied,  "Indisponibil",  cost),
+                "wrong_captcha"   => (PlateStatus.Error,     "Captcha greșit", cost),
+                "captcha_error"   => (PlateStatus.Error,     "Captcha greșit", cost),
+                "invalid_captcha" => (PlateStatus.Error,     "Captcha greșit", cost),
+                _                 => (PlateStatus.Error,     $"XML necunoscut: {res}", cost)
             };
         }
         catch { /* fallback */ }
