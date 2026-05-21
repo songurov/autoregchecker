@@ -94,7 +94,7 @@ else
 
 // ── Proxy list ────────────────────────────────────────────────────────────────
 
-var (proxies, untestedProxies) = LoadProxies();
+var (proxies, allForTesting) = LoadProxies();
 
 Console.Write("\nDescarci listă nouă de proxy-uri din internet? [y/N]: ");
 if ((Console.ReadLine()?.Trim().ToLower() ?? "") == "y")
@@ -104,14 +104,13 @@ if ((Console.ReadLine()?.Trim().ToLower() ?? "") == "y")
     if (fresh.Count > 0)
     {
         SaveAllProxiesFile(fresh);
-        var workingSet  = new HashSet<string?>(proxies.Where(p => p != null));
-        var newUntested = fresh.Where(p => p != null && !workingSet.Contains(p)).Cast<string?>().ToList();
-        int nullIdx = proxies.IndexOf(null);
-        proxies.InsertRange(nullIdx >= 0 ? nullIdx : proxies.Count, newUntested);
-        foreach (var p in newUntested)
-            if (!untestedProxies.Contains(p)) untestedProxies.Add(p);
+        var workingSet = new HashSet<string?>(proxies.Where(p => p != null));
+        // Only add to testing queue, NOT to active proxies list
+        var newForTest = fresh.Where(p => p != null && !workingSet.Contains(p) && !allForTesting.Contains(p))
+                              .Cast<string?>().ToList();
+        allForTesting.AddRange(newForTest);
         Console.WriteLine($"Descărcate {fresh.Count} proxy-uri → {ProxiesAllFile}.");
-        Console.WriteLine($"  {proxies.Count(p => p != null)} total | {untestedProxies.Count} de testat în fundal");
+        Console.WriteLine($"  Active (verificate): {proxies.Count(p => p != null)} | De testat în fundal: {allForTesting.Count}");
     }
     else
     {
@@ -126,33 +125,68 @@ if (proxies.Count == 1 && proxies[0] == null)
     if (!string.IsNullOrEmpty(inp)) proxies.Insert(0, inp);
 }
 
-int knownWorking = proxies.Count(p => p != null) - untestedProxies.Count;
-Console.WriteLine($"Proxy-uri: {proxies.Count(p => p != null)} total ({knownWorking} verificate, {untestedProxies.Count} în testare fundal) + direct");
+Console.WriteLine($"Proxy-uri active: {proxies.Count(p => p != null)} verificate | {allForTesting.Count} netestate → fundal");
 
-// ── Sesiune inițială ──────────────────────────────────────────────────────────
+// ── Fundal: pornit înainte de sesiune, ca să poată popula lista ──────────────
 
-int proxyIdx    = 0;
-HttpClient http = null!;
+var freshWorking = new ConcurrentQueue<string?>();
+using var bgCts  = new CancellationTokenSource();
+var bgTask   = Task.Run(() => TestProxiesInBackground(allForTesting, freshWorking, bgCts.Token));
+var rvTask   = Task.Run(() => ReverifyWorkingProxies(bgCts.Token));
+
+// ── Sesiune inițială (numai din lista verificată) ─────────────────────────────
+
+int proxyIdx     = 0;
+HttpClient http  = null!;
 CookieContainer jar = null!;
+string? currentProxy = null;
 
-while (proxyIdx < proxies.Count)
+// 1. Încearcă proxies din proxies_working.txt
+while (proxyIdx < proxies.Count && proxies[proxyIdx] != null)
 {
     (http, jar) = CreateHttpClient(proxies[proxyIdx]);
-    if (await InitSession(http, jar)) break;
+    if (await InitSession(http, jar)) { currentProxy = proxies[proxyIdx]; break; }
     http.Dispose();
     Console.WriteLine("      Sar la proxy următor...");
     proxyIdx++;
 }
 
-if (proxyIdx >= proxies.Count) { Console.WriteLine("Niciun proxy funcțional. Ieșire."); return; }
+// 2. Dacă working list e goală, aşteaptă background-ul
+if (currentProxy == null)
+{
+    Console.WriteLine($"  proxies_working.txt gol — aștept background-ul să verifice proxy-uri din proxies_all.txt...");
+    int waited = 0;
+    while (currentProxy == null && waited < 180)
+    {
+        if (freshWorking.TryDequeue(out var bgProxy))
+        {
+            (http, jar) = CreateHttpClient(bgProxy);
+            if (await InitSession(http, jar)) { currentProxy = bgProxy; break; }
+            http.Dispose();
+        }
+        else
+        {
+            await Task.Delay(2000);
+            waited += 2;
+            if (waited % 10 == 0 && !bgTask.IsCompleted)
+                Console.WriteLine($"  ...{waited}s așteptat...");
+        }
+        if (bgTask.IsCompleted && freshWorking.IsEmpty) break;
+    }
+}
 
-string? currentProxy = proxies[proxyIdx];
-
-// ── Fundal: testare proxy-uri netestate ───────────────────────────────────────
-
-var freshWorking = new ConcurrentQueue<string?>();
-using var bgCts  = new CancellationTokenSource();
-var bgTask = Task.Run(() => TestProxiesInBackground(untestedProxies, freshWorking, bgCts.Token));
+// 3. Fallback final: conexiune directă
+if (currentProxy == null)
+{
+    Console.WriteLine("  Niciun proxy disponibil → încerc direct.");
+    (http, jar) = CreateHttpClient(null);
+    if (!await InitSession(http, jar))
+    {
+        Console.WriteLine("✗ Serverul nu răspunde. Ieșire.");
+        bgCts.Cancel(); try { await bgTask; } catch { }
+        return;
+    }
+}
 
 // ── Batch loop ────────────────────────────────────────────────────────────────
 
@@ -164,7 +198,8 @@ const int ProbeEvery = 5; // canary check every N plates
 
 for (int i = startNum; i <= endNum; i++)
 {
-    string plate = prefix + (padWidth > 0 ? i.ToString().PadLeft(padWidth, '0') : i.ToString());
+    string plate    = prefix + (padWidth > 0 ? i.ToString().PadLeft(padWidth, '0') : i.ToString());
+    var plateTimer  = Stopwatch.StartNew();
     PlateResult pr;
 
     // Periodic canary: probe captcha URL before real request
@@ -182,12 +217,18 @@ for (int i = startNum; i <= endNum; i++)
                 string? candidate;
                 if (freshWorking.TryDequeue(out var bgProxy))
                     candidate = bgProxy;
-                else
+                else if (proxyIdx + 1 < proxies.Count)
                 {
                     proxyIdx++;
-                    if (proxyIdx >= proxies.Count) break;
                     candidate = proxies[proxyIdx];
                 }
+                else if (!bgTask.IsCompleted)
+                {
+                    await Task.Delay(2000);
+                    continue;
+                }
+                else break;
+
                 (http, jar) = CreateHttpClient(candidate);
                 if (await InitSession(http, jar)) { currentProxy = candidate; found = true; }
                 else http.Dispose();
@@ -214,14 +255,21 @@ for (int i = startNum; i <= endNum; i++)
                 if (freshWorking.TryDequeue(out var bgProxy))
                 {
                     candidate = bgProxy;
-                    Console.WriteLine($"      ↳ Candidat fundal: {ProxyLabel(candidate)}");
+                    Console.WriteLine($"      ↳ [BG verificat] {ProxyLabel(candidate)}");
                 }
-                else
+                else if (proxyIdx + 1 < proxies.Count)
                 {
                     proxyIdx++;
-                    if (proxyIdx >= proxies.Count) break;
-                    candidate = proxies[proxyIdx];
+                    candidate = proxies[proxyIdx]; // null = direct
                 }
+                else if (!bgTask.IsCompleted)
+                {
+                    Console.Write("      ⏳ Aștept proxy verificat din fundal...\r");
+                    await Task.Delay(2000);
+                    continue;
+                }
+                else
+                    break;
 
                 (http, jar) = CreateHttpClient(candidate);
                 if (await InitSession(http, jar))
@@ -239,6 +287,7 @@ for (int i = startNum; i <= endNum; i++)
         else break;
     }
 
+    pr = pr with { TotalMs = plateTimer.ElapsedMilliseconds };
     results.Add(pr);
     PrintRow(pr, results.Count, currentProxy);
 
@@ -262,7 +311,7 @@ for (int i = startNum; i <= endNum; i++)
 
 Done:
 bgCts.Cancel();
-try { await bgTask; } catch { }
+try { await Task.WhenAll(bgTask, rvTask); } catch { }
 http.Dispose();
 
 // ── Retry automat erori ───────────────────────────────────────────────────────
@@ -311,26 +360,27 @@ catch { /* ignoră */ }
 
 static (List<string?>, List<string?>) LoadProxies()
 {
+    // Working list: ONLY verified proxies (used by main loop)
     var working    = LoadProxyFile(ProxiesWorkingFile);
     var workingSet = new HashSet<string?>(working.Where(p => p != null));
-    if (working.Count > 0)
-        Console.WriteLine($"Proxy-uri verificate: {working.Count} din {ProxiesWorkingFile}");
+    Console.WriteLine(working.Count > 0
+        ? $"Proxy-uri verificate (active): {working.Count} din {ProxiesWorkingFile}"
+        : $"  {ProxiesWorkingFile} gol — background va popula lista");
 
-    var all      = LoadProxyFile(ProxiesAllFile);
-    var untested = all.Where(p => p != null && !workingSet.Contains(p)).Cast<string?>().ToList();
+    // All proxies: fed only to background tester
+    var all     = LoadProxyFile(ProxiesAllFile);
+    var forTest = all.Where(p => p != null && !workingSet.Contains(p)).Cast<string?>().ToList();
     if (all.Count > 0)
-        Console.WriteLine($"Proxy-uri totale în {ProxiesAllFile}: {all.Count} ({untested.Count} netestate)");
+        Console.WriteLine($"Proxy-uri pentru fundal: {forTest.Count} netestate din {all.Count} în {ProxiesAllFile}");
 
+    // Active list = working only (NOT untested)
     var combined = new List<string?>(working);
-    combined.AddRange(untested);
-
     string envP = Environment.GetEnvironmentVariable("HTTPS_PROXY")
                ?? Environment.GetEnvironmentVariable("HTTP_PROXY") ?? "";
     if (!string.IsNullOrEmpty(envP) && !combined.Contains(envP))
         combined.Insert(0, envP);
-
-    combined.Add(null);
-    return (combined, untested);
+    combined.Add(null); // direct fallback always last
+    return (combined, forTest);
 }
 
 static List<string?> LoadProxyFile(string filename)
@@ -341,8 +391,28 @@ static List<string?> LoadProxyFile(string filename)
     foreach (string line in File.ReadAllLines(path))
     {
         string t = line.Trim();
-        if (!string.IsNullOrEmpty(t) && !t.StartsWith('#'))
-            list.Add(t);
+        if (string.IsNullOrEmpty(t) || t.StartsWith('#')) continue;
+        // Support both "proxy" and "proxy|timestamp" formats
+        list.Add(t.Contains('|') ? t[..t.IndexOf('|')].Trim() : t);
+    }
+    return list;
+}
+
+// Returns proxies from working file along with their verified timestamps
+static List<(string proxy, DateTime verifiedAt)> LoadWorkingProxiesWithTimestamp()
+{
+    var list = new List<(string, DateTime)>();
+    string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ProxiesWorkingFile);
+    if (!File.Exists(path)) return list;
+    foreach (string line in File.ReadAllLines(path))
+    {
+        string t = line.Trim();
+        if (string.IsNullOrEmpty(t) || t.StartsWith('#')) continue;
+        int sep = t.IndexOf('|');
+        if (sep < 0) { list.Add((t, DateTime.MinValue)); continue; }
+        string proxy = t[..sep].Trim();
+        DateTime.TryParse(t[(sep + 1)..].Trim(), out var ts);
+        list.Add((proxy, ts));
     }
     return list;
 }
@@ -410,6 +480,47 @@ static string ProxyLabel(string? proxy) =>
 // Fundal: testare proxy-uri netestate
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Re-verifies proxies already in proxies_working.txt older than maxAgeMinutes
+static async Task ReverifyWorkingProxies(CancellationToken ct, int maxAgeMinutes = 30)
+{
+    while (!ct.IsCancellationRequested)
+    {
+        var entries = LoadWorkingProxiesWithTimestamp();
+        var stale   = entries.Where(e => (DateTime.UtcNow - e.verifiedAt).TotalMinutes >= maxAgeMinutes).ToList();
+
+        if (stale.Count > 0)
+        {
+            Console.WriteLine($"[BG-RV] Re-verific {stale.Count} proxy-uri vechi (>{maxAgeMinutes}min)...");
+            var stillGood = new List<(string proxy, string ts)>();
+
+            foreach (var (proxy, _) in stale)
+            {
+                if (ct.IsCancellationRequested) break;
+                bool ok = await TestProxyQuick(proxy, ct);
+                if (ok)
+                {
+                    stillGood.Add((proxy, DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss")));
+                    Console.WriteLine($"[BG-RV] ✓ {ProxyLabel(proxy)}");
+                }
+                else
+                    Console.WriteLine($"[BG-RV] ✗ Eliminat: {ProxyLabel(proxy)}");
+
+                try { await Task.Delay(500, ct); } catch (OperationCanceledException) { break; }
+            }
+
+            // Rewrite working file: keep fresh entries + re-verified ones
+            var fresh = entries.Where(e => (DateTime.UtcNow - e.verifiedAt).TotalMinutes < maxAgeMinutes)
+                               .Select(e => (e.proxy, e.verifiedAt.ToString("yyyy-MM-dd HH:mm:ss")));
+            RewriteWorkingFile(fresh.Concat(stillGood));
+            Console.WriteLine($"[BG-RV] {ProxiesWorkingFile} actualizat: {fresh.Count() + stillGood.Count} proxy-uri valide");
+        }
+
+        // Check again after half the max age window
+        try { await Task.Delay(TimeSpan.FromMinutes(maxAgeMinutes / 2), ct); }
+        catch (OperationCanceledException) { break; }
+    }
+}
+
 static async Task TestProxiesInBackground(
     List<string?> toTest, ConcurrentQueue<string?> freshWorking, CancellationToken ct)
 {
@@ -455,7 +566,20 @@ static async Task<bool> TestProxyQuick(string proxyUri, CancellationToken ct)
 static void AppendToWorkingFile(string proxy)
 {
     string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ProxiesWorkingFile);
-    File.AppendAllLines(path, new[] { proxy });
+    string line = $"{proxy}|{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}";
+    File.AppendAllLines(path, new[] { line });
+}
+
+static void RewriteWorkingFile(IEnumerable<(string proxy, string ts)> entries)
+{
+    string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ProxiesWorkingFile);
+    var lines = new List<string>
+    {
+        $"# Actualizat: {DateTime.Now:dd.MM.yyyy HH:mm:ss}",
+        ""
+    };
+    lines.AddRange(entries.Select(e => $"{e.proxy}|{e.ts}"));
+    File.WriteAllLines(path, lines);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -624,11 +748,11 @@ static void PrintRow(PlateResult r, int idx, string? proxy, bool isRetry = false
 
     if (r.CaptchaMs > 0 || r.OpenAiMs > 0 || r.ServerMs > 0)
     {
-        string capPart = r.CaptchaMs > 0 ? $"cap:{FmtMs(r.CaptchaMs)}" : "cap:—";
-        string aiPart  = r.OpenAiMs  > 0 ? $"ai:{FmtMs(r.OpenAiMs)}"   : "ai:—";
-        string srvPart = r.ServerMs  > 0 ? $"srv:{FmtMs(r.ServerMs)}"  : "";
-        string srvDisp = srvPart.Length > 0 ? $"  {srvPart}" : "";
-        Console.WriteLine($"         ↳ {capPart}  {aiPart}{srvDisp}");
+        string capPart   = r.CaptchaMs > 0 ? $"cap:{FmtMs(r.CaptchaMs)}" : "cap:—";
+        string aiPart    = r.OpenAiMs  > 0 ? $"ai:{FmtMs(r.OpenAiMs)}"   : "ai:—";
+        string srvPart   = r.ServerMs  > 0 ? $"srv:{FmtMs(r.ServerMs)}"  : "";
+        string totalPart = r.TotalMs   > 0 ? $"  total:{FmtMs(r.TotalMs)}" : "";
+        Console.WriteLine($"         ↳ {capPart}  {aiPart}  {srvPart}{totalPart}");
     }
 }
 
@@ -770,7 +894,8 @@ static string GenerateHtml(List<PlateResult> results, string prefix, string star
         string timingHtml = r.ServerMs > 0
             ? $"<span title='captcha fetch'>↓{FmtMs(r.CaptchaMs)}</span> " +
               $"<span title='OpenAI'>🤖{FmtMs(r.OpenAiMs)}</span> " +
-              $"<span title='server response'>→{FmtMs(r.ServerMs)}</span>"
+              $"<span title='server response'>→{FmtMs(r.ServerMs)}</span> " +
+              $"<b title='total'>⏱{FmtMs(r.TotalMs)}</b>"
             : r.OpenAiMs > 0
                 ? $"<span title='captcha fetch'>↓{FmtMs(r.CaptchaMs)}</span> " +
                   $"<span title='OpenAI'>🤖{FmtMs(r.OpenAiMs)}</span>"
@@ -865,6 +990,6 @@ static string GenerateHtml(List<PlateResult> results, string prefix, string star
 enum PlateStatus { Available, Occupied, Error }
 
 record PlateResult(string Plate, string Captcha, string RawResponse, PlateStatus Status, string StatusText,
-    decimal Cost = 0, string Payload = "", long CaptchaMs = 0, long OpenAiMs = 0, long ServerMs = 0);
+    decimal Cost = 0, string Payload = "", long CaptchaMs = 0, long OpenAiMs = 0, long ServerMs = 0, long TotalMs = 0);
 
 record AppConfig(string? OpenAiKey = null);
