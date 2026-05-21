@@ -10,8 +10,9 @@ obj/
 # Runtime config (contains API key!)
 config.json
 
-# Proxy list (generated at runtime)
-proxies.txt
+# Proxy lists (generated at runtime)
+proxies_all.txt
+proxies_working.txt
 
 # Temp captcha images
 /tmp/cap_*
