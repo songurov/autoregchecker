@@ -508,7 +508,7 @@ static async Task<PlateResult> CheckPlate(
         postReq.Headers.Add("Sec-Fetch-Site",   "same-origin");
 
         string raw;
-        long serverMs;
+        long serverMs = 0;
         try
         {
             sw.Restart();
@@ -620,12 +620,16 @@ static void PrintRow(PlateResult r, int idx, string? proxy, bool isRetry = false
     string icon  = r.Status switch { PlateStatus.Available => "✓", PlateStatus.Occupied => "✗", _ => "!" };
     string price = r.Cost > 0 ? $"  {r.Cost:N0} MDL" : "";
     string plbl  = ProxyLabel(proxy)[..Math.Min(20, ProxyLabel(proxy).Length)];
-    string timing = r.ServerMs > 0
-        ? $"  [cap:{FmtMs(r.CaptchaMs)} ai:{FmtMs(r.OpenAiMs)} srv:{FmtMs(r.ServerMs)}]"
-        : r.OpenAiMs > 0
-            ? $"  [cap:{FmtMs(r.CaptchaMs)} ai:{FmtMs(r.OpenAiMs)}]"
-            : "";
-    Console.WriteLine($"{tag}{idx,-4} {plbl,-22} {r.Plate,-12} {r.Captcha,-8} {icon} {r.StatusText}{price}{timing}");
+    Console.WriteLine($"{tag}{idx,-4} {plbl,-22} {r.Plate,-12} {r.Captcha,-8} {icon} {r.StatusText}{price}");
+
+    if (r.CaptchaMs > 0 || r.OpenAiMs > 0 || r.ServerMs > 0)
+    {
+        string capPart = r.CaptchaMs > 0 ? $"cap:{FmtMs(r.CaptchaMs)}" : "cap:—";
+        string aiPart  = r.OpenAiMs  > 0 ? $"ai:{FmtMs(r.OpenAiMs)}"   : "ai:—";
+        string srvPart = r.ServerMs  > 0 ? $"srv:{FmtMs(r.ServerMs)}"  : "";
+        string srvDisp = srvPart.Length > 0 ? $"  {srvPart}" : "";
+        Console.WriteLine($"         ↳ {capPart}  {aiPart}{srvDisp}");
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
