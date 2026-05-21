@@ -40,16 +40,37 @@ Console.Write("Tip placuță [1=Standard, 2=Personalizat, 0=Null] (implicit 1): 
 string signDestRaw = Console.ReadLine()?.Trim() ?? "1";
 string signDest    = signDestRaw == "2" ? "2" : signDestRaw == "0" ? "" : "1";
 
-Console.Write("Delay între cereri în secunde (implicit 2): ");
+Console.Write("Delay minim între cereri în sec (implicit 2): ");
 string delayInput = Console.ReadLine()?.Trim() ?? "";
-int delayMs = (int.TryParse(delayInput, out int d) && d >= 0 ? d : 2) * 1000;
+int delayMinMs = (int.TryParse(delayInput, out int d) && d >= 0 ? d : 2) * 1000;
+
+Console.Write("Delay maxim între cereri în sec (implicit 5): ");
+string delayMaxInput = Console.ReadLine()?.Trim() ?? "";
+int delayMaxMs = (int.TryParse(delayMaxInput, out int dmax) && dmax >= 0 ? dmax : 5) * 1000;
+if (delayMaxMs < delayMinMs) delayMaxMs = delayMinMs * 2;
+
+Console.Write("Pauză lungă după fiecare N cereri, 0=off (implicit 10): ");
+string batchEveryStr = Console.ReadLine()?.Trim() ?? "";
+int batchPauseEvery = int.TryParse(batchEveryStr, out int bp) && bp >= 0 ? bp : 10;
+
+int batchPauseMinMs = 0, batchPauseMaxMs = 0;
+if (batchPauseEvery > 0)
+{
+    Console.Write("Durată pauză lungă în sec (implicit 45): ");
+    string pauseStr = Console.ReadLine()?.Trim() ?? "";
+    int basePause = (int.TryParse(pauseStr, out int ps) && ps > 0 ? ps : 45) * 1000;
+    batchPauseMinMs = basePause;
+    batchPauseMaxMs = basePause + 20_000;
+}
 
 int total    = endNum - startNum + 1;
 int maxRetry = 3;
 
 string fmtS = padWidth > 0 ? startNum.ToString().PadLeft(padWidth, '0') : startStr;
 string fmtE = padWidth > 0 ? endNum.ToString().PadLeft(padWidth, '0')   : endStr;
-Console.WriteLine($"\nRange: {prefix}{fmtS} → {prefix}{fmtE}  ({total} numere)\n");
+Console.WriteLine($"\nRange: {prefix}{fmtS} → {prefix}{fmtE}  ({total} numere)");
+Console.WriteLine($"Delay: {delayMinMs / 1000}–{delayMaxMs / 1000}s aleator" +
+    (batchPauseEvery > 0 ? $" | Pauză {batchPauseMinMs / 1000}–{batchPauseMaxMs / 1000}s la fiecare {batchPauseEvery} cereri" : "") + "\n");
 
 // ── OpenAI key ────────────────────────────────────────────────────────────────
 
@@ -187,7 +208,23 @@ for (int i = startNum; i <= endNum; i++)
 
     results.Add(pr);
     PrintRow(pr, results.Count, currentProxy);
-    if (i < endNum && delayMs > 0) await Task.Delay(delayMs);
+
+    if (i < endNum)
+    {
+        int processed = i - startNum + 1;
+
+        // Batch pause: long break every N requests
+        if (batchPauseEvery > 0 && processed % batchPauseEvery == 0)
+        {
+            int pauseMs = Random.Shared.Next(batchPauseMinMs, batchPauseMaxMs + 1);
+            Console.WriteLine($"\n      [PAUZĂ] {processed} verificate → {pauseMs / 1000}s răcire...\n");
+            await Task.Delay(pauseMs);
+        }
+        else if (delayMinMs > 0 || delayMaxMs > 0)
+        {
+            await Task.Delay(Random.Shared.Next(delayMinMs, delayMaxMs + 1));
+        }
+    }
 }
 
 Done:
@@ -209,7 +246,8 @@ if (errorIdx.Count > 0)
             var newR = await CheckPlate(http2, apiKey, old.Plate, signDest, maxRetry);
             results[idx] = newR;
             PrintRow(newR, idx + 1, currentProxy, isRetry: true);
-            if (delayMs > 0) await Task.Delay(delayMs);
+            if (delayMinMs > 0 || delayMaxMs > 0)
+                await Task.Delay(Random.Shared.Next(delayMinMs, delayMaxMs + 1));
         }
     }
     http2.Dispose();
@@ -396,6 +434,9 @@ static async Task<PlateResult> CheckPlate(
             if (attempt < maxRetry) continue;
             return new PlateResult(plate, "?", "captcha_fail", PlateStatus.Error, "Eroare captcha");
         }
+
+        // Simulate human reading time before submitting
+        await Task.Delay(Random.Shared.Next(1500, 3001));
 
         var fields = new Dictionary<string, string>
         {
