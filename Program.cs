@@ -440,11 +440,11 @@ static async Task<bool> TestProxyQuick(string proxyUri, CancellationToken ct)
     try
     {
         var (http, _) = CreateHttpClient(proxyUri);
-        http.Timeout = TimeSpan.FromSeconds(10);
+        http.Timeout = TimeSpan.FromSeconds(5);
         using (http)
         using (var linked = CancellationTokenSource.CreateLinkedTokenSource(ct))
         {
-            linked.CancelAfter(TimeSpan.FromSeconds(10));
+            linked.CancelAfter(TimeSpan.FromSeconds(5));
             var resp = await http.GetAsync(RefererUrl, linked.Token);
             return (int)resp.StatusCode < 500;
         }
@@ -467,16 +467,23 @@ static async Task<PlateResult> CheckPlate(
 {
     for (int attempt = 1; attempt <= maxRetry; attempt++)
     {
+        var sw = Stopwatch.StartNew();
         byte[]? captchaBytes = await FetchWithRetry(http, CaptchaUrl);
-        if (captchaBytes is null)
-            return new PlateResult(plate, "?", "network_timeout", PlateStatus.Error, "Timeout rețea");
+        long captchaMs = sw.ElapsedMilliseconds;
 
+        if (captchaBytes is null)
+            return new PlateResult(plate, "?", "network_timeout", PlateStatus.Error, "Timeout rețea",
+                CaptchaMs: captchaMs);
+
+        sw.Restart();
         string captcha = await ReadCaptchaWithOpenAI(apiKey, captchaBytes);
+        long openAiMs = sw.ElapsedMilliseconds;
 
         if (!Regex.IsMatch(captcha, @"^\d{4}$"))
         {
             if (attempt < maxRetry) continue;
-            return new PlateResult(plate, "?", "captcha_fail", PlateStatus.Error, "Eroare captcha");
+            return new PlateResult(plate, "?", "captcha_fail", PlateStatus.Error, "Eroare captcha",
+                CaptchaMs: captchaMs, OpenAiMs: openAiMs);
         }
 
         // Simulate human reading time before submitting
@@ -504,28 +511,36 @@ static async Task<PlateResult> CheckPlate(
         postReq.Headers.Add("Sec-Fetch-Site",   "same-origin");
 
         string raw;
+        long serverMs;
         try
         {
-            using var postCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            sw.Restart();
+            using var postCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             var postResp = await http.SendAsync(postReq, postCts.Token);
+            serverMs = sw.ElapsedMilliseconds;
             if (IsBlockedStatus((int)postResp.StatusCode))
-                return new PlateResult(plate, captcha, "ip_blocked", PlateStatus.Error, $"IP blocat (HTTP {(int)postResp.StatusCode})");
+                return new PlateResult(plate, captcha, "ip_blocked", PlateStatus.Error,
+                    $"IP blocat (HTTP {(int)postResp.StatusCode})",
+                    CaptchaMs: captchaMs, OpenAiMs: openAiMs, ServerMs: serverMs);
             raw = (await postResp.Content.ReadAsStringAsync(postCts.Token)).Trim();
         }
         catch (Exception ex) when (ex is TaskCanceledException or OperationCanceledException)
         {
-            return new PlateResult(plate, captcha, "network_timeout", PlateStatus.Error, "Timeout rețea");
+            return new PlateResult(plate, captcha, "network_timeout", PlateStatus.Error, "Timeout rețea",
+                CaptchaMs: captchaMs, OpenAiMs: openAiMs);
         }
         catch (HttpRequestException)
         {
-            return new PlateResult(plate, captcha, "network_fail", PlateStatus.Error, "Rețea căzută");
+            return new PlateResult(plate, captcha, "network_fail", PlateStatus.Error, "Rețea căzută",
+                CaptchaMs: captchaMs, OpenAiMs: openAiMs);
         }
 
         if (raw.Equals("error0", StringComparison.OrdinalIgnoreCase) && attempt < maxRetry)
             continue;
 
         var (status, text, cost) = ClassifyResult(raw);
-        return new PlateResult(plate, captcha, raw, status, text, cost, payload);
+        return new PlateResult(plate, captcha, raw, status, text, cost, payload,
+            CaptchaMs: captchaMs, OpenAiMs: openAiMs, ServerMs: serverMs);
     }
 
     return new PlateResult(plate, "?", "max_retry", PlateStatus.Error, "Max retry depășit");
@@ -540,7 +555,7 @@ static async Task<byte[]?> FetchWithRetry(HttpClient http, string url, int maxAt
     {
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             var resp = await http.GetAsync(url, cts.Token);
             if (IsBlockedStatus((int)resp.StatusCode))
             {
@@ -588,13 +603,20 @@ static (PlateStatus, string, decimal) ClassifyResult(string raw)
     };
 }
 
+static string FmtMs(long ms) => ms >= 1000 ? $"{ms / 1000.0:F1}s" : $"{ms}ms";
+
 static void PrintRow(PlateResult r, int idx, string? proxy, bool isRetry = false)
 {
     string tag   = isRetry ? "[R]" : "   ";
     string icon  = r.Status switch { PlateStatus.Available => "✓", PlateStatus.Occupied => "✗", _ => "!" };
     string price = r.Cost > 0 ? $"  {r.Cost:N0} MDL" : "";
     string plbl  = ProxyLabel(proxy)[..Math.Min(20, ProxyLabel(proxy).Length)];
-    Console.WriteLine($"{tag}{idx,-4} {plbl,-22} {r.Plate,-12} {r.Captcha,-8} {icon} {r.StatusText}{price}");
+    string timing = r.ServerMs > 0
+        ? $"  [cap:{FmtMs(r.CaptchaMs)} ai:{FmtMs(r.OpenAiMs)} srv:{FmtMs(r.ServerMs)}]"
+        : r.OpenAiMs > 0
+            ? $"  [cap:{FmtMs(r.CaptchaMs)} ai:{FmtMs(r.OpenAiMs)}]"
+            : "";
+    Console.WriteLine($"{tag}{idx,-4} {plbl,-22} {r.Plate,-12} {r.Captcha,-8} {icon} {r.StatusText}{price}{timing}");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -731,12 +753,21 @@ static string GenerateHtml(List<PlateResult> results, string prefix, string star
         string icon = r.Status switch { PlateStatus.Available => "✓ Disponibil", PlateStatus.Occupied => "✗ Ocupat", _ => "⚠ Eroare" };
         string price   = r.Cost > 0 ? $"{r.Cost:N0} MDL" : "—";
         string dispNum = Regex.Replace(r.Plate, @"^([A-Za-z]+)(\d+)$", "$1 $2");
-        string payDisp = string.IsNullOrEmpty(r.Payload) ? "—" : WebUtility.HtmlEncode(r.Payload);
+        string payDisp  = string.IsNullOrEmpty(r.Payload) ? "—" : WebUtility.HtmlEncode(r.Payload);
+        string timingHtml = r.ServerMs > 0
+            ? $"<span title='captcha fetch'>↓{FmtMs(r.CaptchaMs)}</span> " +
+              $"<span title='OpenAI'>🤖{FmtMs(r.OpenAiMs)}</span> " +
+              $"<span title='server response'>→{FmtMs(r.ServerMs)}</span>"
+            : r.OpenAiMs > 0
+                ? $"<span title='captcha fetch'>↓{FmtMs(r.CaptchaMs)}</span> " +
+                  $"<span title='OpenAI'>🤖{FmtMs(r.OpenAiMs)}</span>"
+                : "—";
         rows.AppendLine(
             $"<tr class=\"{css}\"><td>{i + 1}</td>" +
             $"<td><strong>{WebUtility.HtmlEncode(dispNum)}</strong></td>" +
             $"<td>{icon}</td>" +
             $"<td class=\"price\">{price}</td>" +
+            $"<td class=\"timing\">{timingHtml}</td>" +
             $"<td class=\"payload\">{payDisp}</td>" +
             $"<td class=\"raw\">{WebUtility.HtmlEncode(r.RawResponse)}</td></tr>");
     }
@@ -772,6 +803,8 @@ static string GenerateHtml(List<PlateResult> results, string prefix, string star
         .row-error td { background: #eff6ff; color: #1e3a6e; }
         .row-error td strong { color: #1d4ed8; }
         .price { font-weight: 600; white-space: nowrap; }
+        .timing { font-family: monospace; font-size: .78rem; white-space: nowrap; color: #444; }
+        .timing span { margin-right: 6px; }
         .payload { font-family: monospace; font-size: .78rem; color: #555; word-break: break-all; }
         .raw { font-family: monospace; font-size: .78rem; color: #888; word-break: break-all; }
         .dataTables_wrapper .dataTables_filter input { border: 1px solid #ddd; border-radius: 6px; padding: 5px 10px; }
@@ -790,7 +823,7 @@ static string GenerateHtml(List<PlateResult> results, string prefix, string star
       </div>
       <div class="table-wrap">
         <table id="tbl" class="dataTable display" style="width:100%">
-          <thead><tr><th>#</th><th>Număr</th><th>Status</th><th>Preț</th><th>Payload trimis</th><th>Răspuns brut</th></tr></thead>
+          <thead><tr><th>#</th><th>Număr</th><th>Status</th><th>Preț</th><th>Timpi</th><th>Payload trimis</th><th>Răspuns brut</th></tr></thead>
           <tbody>{{rows}}</tbody>
         </table>
       </div>
@@ -818,6 +851,7 @@ static string GenerateHtml(List<PlateResult> results, string prefix, string star
 
 enum PlateStatus { Available, Occupied, Error }
 
-record PlateResult(string Plate, string Captcha, string RawResponse, PlateStatus Status, string StatusText, decimal Cost = 0, string Payload = "");
+record PlateResult(string Plate, string Captcha, string RawResponse, PlateStatus Status, string StatusText,
+    decimal Cost = 0, string Payload = "", long CaptchaMs = 0, long OpenAiMs = 0, long ServerMs = 0);
 
 record AppConfig(string? OpenAiKey = null);
